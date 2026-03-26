@@ -4,6 +4,7 @@ Portály: Sreality (API), Bezrealitky (Playwright), Reas (Playwright)
 """
 
 import os
+import re
 import time
 import logging
 import sqlite3
@@ -157,11 +158,14 @@ def process(listing: dict):
 # ─────────────────────────────────────────────────────────────
 # SREALITY  (JSON API — čisté requests, bez Playwright)
 #
-# Správný formát URL detailu:
-#   https://www.sreality.cz/detail/prodej/byt/<dispozice-slug>/<lokalita-slug>/<hash_id>
+# OPRAVA 1: locality_region_id=10 je Středočeský kraj ✓
+#           (původní kód byl správný, Praha by byla =11 — necháme 10)
 #
-# API vrací hash_id v poli _embedded.estates[].hash_id
-# a seo slug v poli seo.locality + name
+# OPRAVA 2: _sreality_url() — category_sub_cb není v seo{},
+#           ale přímo v kořenu objektu estate jako "type" nebo
+#           v poli "seo.category_sub_cb" — správně čteme z
+#           estate["type"]["value"] nebo jako fallback z názvu.
+#           Nejspolehlivější: číst sub_cb přímo z estate dict.
 # ─────────────────────────────────────────────────────────────
 SREALITY_HEADERS = {
     "User-Agent": (
@@ -174,36 +178,60 @@ SREALITY_HEADERS = {
     "Referer": "https://www.sreality.cz/",
 }
 
-# locality_region_id=10 = Středočeský kraj
+# locality_region_id=10 = Středočeský kraj (Praha = 11, záměrně vynecháno)
 SREALITY_API = (
     "https://www.sreality.cz/api/cs/v2/estates"
     "?category_main_cb=1"          # byty
     "&category_type_cb=1"          # prodej
-    "&locality_region_id=10"       # Středočeský kraj
+    "&locality_region_id=10"       # Středočeský kraj BEZ Prahy
     "&price_max={price_max}"
     "&category_sub_cb={subs}"
     "&per_page=60"
     "&page={page}"
 )
 
+# FIX: Správný slovník slug → musí odpovídat tomu co Sreality čeká v URL
+# Formát detailu: /detail/prodej/byt/2+1/lokalita/hash_id
+# Sreality používá "2+1" (s plusem), ne "2%2B1"
 DISPOSITION_SLUGS = {2: "1+kk", 3: "1+1", 4: "2+kk", 5: "2+1"}
 
 
 def _sreality_url(estate: dict) -> str:
     """
     Sestaví klikatelné URL detailu ze slovníku inzerátu.
-    Formát: /detail/prodej/byt/<disp-slug>/<seo-locality>/<hash_id>
+
+    OPRAVA: category_sub_cb není v seo{} — je přímo v estate dict
+    pod klíčem "type" (nested) nebo jako samostatné pole.
+    Bezpečně ho extrahujeme ze všech možných míst.
+
+    Správný formát URL:
+      https://www.sreality.cz/detail/prodej/byt/2+kk/stredocesky-kraj-Praha-vychod-ricany/123456789
     """
     hash_id = estate.get("hash_id", "")
-    # dispozice slug z API
-    sub_cb = estate.get("seo", {}).get("category_sub_cb", 0)
-    disp_slug = DISPOSITION_SLUGS.get(sub_cb, "byt")
-    disp_slug = disp_slug.replace("+", "+")   # už správně
-
-    # lokalita slug z SEO pole
     locality = estate.get("seo", {}).get("locality", "")
 
+    # FIX: sub_cb čteme z kořene estate dict, ne z seo{}
+    # API vrací např. estate["type"]["value"] = 4  nebo  estate["category_sub_cb"] = 4
+    sub_cb = (
+        estate.get("category_sub_cb")                          # přímé pole (někdy přítomno)
+        or estate.get("type", {}).get("value")                 # nested type objekt
+        or _guess_sub_cb_from_name(estate.get("name", ""))     # fallback z názvu
+        or 4                                                    # poslední záchrana = 2+kk
+    )
+
+    disp_slug = DISPOSITION_SLUGS.get(int(sub_cb), "byt")
+
     return f"https://www.sreality.cz/detail/prodej/byt/{disp_slug}/{locality}/{hash_id}"
+
+
+def _guess_sub_cb_from_name(name: str) -> int | None:
+    """Odhadne dispozici z názvu inzerátu jako záložní řešení."""
+    name_lower = name.lower()
+    if "1+kk" in name_lower: return 2
+    if "1+1"  in name_lower: return 3
+    if "2+kk" in name_lower: return 4
+    if "2+1"  in name_lower: return 5
+    return None
 
 
 def scrape_sreality():
@@ -238,7 +266,7 @@ def scrape_sreality():
             if cena_raw and cena_raw > MAX_PRICE:
                 continue
 
-            cena = f"{cena_raw:,} Kč".replace(",", " ") if cena_raw else "Cena neuvedena"
+            cena = f"{cena_raw:,} Kč".replace(",", "\u00a0") if cena_raw else "Cena neuvedena"
             detail_url = _sreality_url(e)
             locality = e.get("seo", {}).get("locality", "")
             hash_id = str(e.get("hash_id", ""))
@@ -267,18 +295,24 @@ def scrape_sreality():
 # ─────────────────────────────────────────────────────────────
 # BEZREALITKY  (Playwright — Cloudflare ochrana)
 #
-# URL search: https://www.bezrealitky.cz/nemovitosti-byty-domy?
-#   offerType=prodej&estateType=byt&regionOsmIds=...&priceMax=5000000
+# OPRAVA 3: Přidán OSM region ID pro Středočeský kraj.
+#           R439353 = Středočeský kraj ✓  (Praha = R435514, záměrně vynecháno)
 #
-# Středočeský kraj = R439353 (OSM relation ID)
+# OPRAVA 4: Dispozice v URL — Bezrealitky používá jiné hodnoty:
+#           DISP_1_KK=1, DISP_1_1=2, DISP_2_KK=3, DISP_2_1=4
+#           Předáváme jako disposition[]=DISP_X_XX ve správném formátu.
 # ─────────────────────────────────────────────────────────────
 BEZ_URL = (
     "https://www.bezrealitky.cz/nemovitosti-byty-domy"
     "?offerType=prodej"
     "&estateType=byt"
-    "&regionOsmIds=R439353"
+    "&regionOsmIds=R439353"        # Středočeský kraj (bez Prahy R435514)
     f"&priceMax={MAX_PRICE}"
-    "&disposition[]=1%2B1&disposition[]=1%2Bkk&disposition[]=2%2B1&disposition[]=2%2Bkk"
+    # FIX: správné hodnoty dispozic pro Bezrealitky
+    "&disposition%5B%5D=DISP_1_KK"
+    "&disposition%5B%5D=DISP_1_1"
+    "&disposition%5B%5D=DISP_2_KK"
+    "&disposition%5B%5D=DISP_2_1"
     "&currency=czk"
 )
 
@@ -296,7 +330,6 @@ def scrape_bezrealitky(page):
         log.error("Bezrealitky načítání: %s", e)
         return
 
-    # Inzeráty jsou v <article> elementech
     articles = page.query_selector_all("article")
     log.info("Bezrealitky — nalezeno %d articleů", len(articles))
 
@@ -323,8 +356,7 @@ def scrape_bezrealitky(page):
             if "bezrealitky.cz" not in href:
                 continue
 
-            # ID z URL (číslo inzerátu)
-            import re
+            # ID z URL
             m = re.search(r"/(\d{5,})", href)
             lid = f"bezrealitky_{m.group(1)}" if m else f"bezrealitky_{hash(href)}"
 
@@ -353,16 +385,21 @@ def scrape_bezrealitky(page):
 # ─────────────────────────────────────────────────────────────
 # REAS  (Playwright — React SPA)
 #
-# URL: https://www.reas.cz/vyhledavani?
-#   typ=prodej&kategorie=byt&kraj=stredocesky&cenaMax=5000000
+# OPRAVA 5: Dispozice v URL byly špatně enkódované.
+#           Reas používá hodnoty: 1kk, 1_1, 2kk, 2_1
+#           (bez plus znaků — plus v URL způsoboval ignorování filtru)
 # ─────────────────────────────────────────────────────────────
 REAS_URL = (
     "https://www.reas.cz/vyhledavani"
     "?typ=prodej"
     "&kategorie=byt"
-    "&kraj=stredocesky"
+    "&kraj=stredocesky"            # Středočeský kraj (Praha záměrně vynecháno)
     f"&cenaMax={MAX_PRICE}"
-    "&dispozice[]=1%2Bkk&dispozice[]=1%2B1&dispozice[]=2%2Bkk&dispozice[]=2%2B1"
+    # FIX: správné hodnoty dispozic pro Reas (bez %2B enkódování)
+    "&dispozice[]=1kk"
+    "&dispozice[]=1_1"
+    "&dispozice[]=2kk"
+    "&dispozice[]=2_1"
 )
 
 
@@ -373,7 +410,6 @@ def scrape_reas(page):
 
     try:
         page.goto(REAS_URL, wait_until="networkidle", timeout=40_000)
-        # Reas je React SPA — počkej na karty inzerátů
         page.wait_for_selector(
             "[class*='PropertyCard'], [class*='property-card'], [class*='listing'], article",
             timeout=20_000,
@@ -381,8 +417,6 @@ def scrape_reas(page):
     except Exception as e:
         log.error("Reas načítání: %s", e)
         return
-
-    import re
 
     # Zkus více možných selektorů karet
     cards = (
@@ -448,7 +482,7 @@ def morning_summary():
     lines = [f"🌅 <b>Ranní souhrn — {datetime.now().strftime('%d.%m.%Y')}</b>"]
     lines.append(f"Celkem dnes nalezeno: <b>{len(rows)}</b> inzerátů\n")
 
-    for zdroj, nadpis, cena, url in rows[:15]:   # max 15 v souhrnu
+    for zdroj, nadpis, cena, url in rows[:15]:
         lines.append(f"• [{zdroj}] {nadpis} — {cena}\n  <a href=\"{url}\">odkaz</a>")
 
     if len(rows) > 15:
