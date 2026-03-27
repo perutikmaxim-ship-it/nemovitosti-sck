@@ -1,6 +1,6 @@
 """
 Hlídač bytů — Středočeský kraj
-Portály: Sreality (API), Bezrealitky (Playwright), Reas (Playwright)
+Portály: Sreality (API), Bezrealitky (requests+BS4), Bazoš (requests+BS4), Reas (Playwright)
 """
 
 import os
@@ -10,9 +10,9 @@ import logging
 import sqlite3
 import schedule
 import requests
+from bs4 import BeautifulSoup
 from datetime import datetime
 
-# Playwright — pro Bezrealitky a Reas (JS portály s anti-botem)
 from playwright.sync_api import sync_playwright
 
 # ─────────────────────────────────────────────────────────────
@@ -21,7 +21,7 @@ from playwright.sync_api import sync_playwright
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-MAX_PRICE              = 5_000_000
+MAX_PRICE              = 4_500_000      # ← opraveno na 4,5M
 CHECK_INTERVAL_MINUTES = 30
 MORNING_SUMMARY_HOUR   = 8
 
@@ -33,7 +33,6 @@ DISPOSITION_LABELS    = {2: "1+kk", 3: "1+1", 4: "2+kk", 5: "2+1"}
 DB_PATH  = "nemovitosti.db"
 LOG_PATH = "scraper.log"
 
-# Klíčová slova → blokovat inzeráty (dražby, exekuce)
 BLOCK_KEYWORDS = [
     "dražb", "exekuc", "insolvenc", "nucený prodej",
     "zástavní", "předkupní právo",
@@ -105,7 +104,7 @@ def get_todays_listings():
 # ─────────────────────────────────────────────────────────────
 def send_telegram(text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram není nakonfigurován.")
+        log.warning("Telegram není nakonfigurován — nastav TELEGRAM_TOKEN a TELEGRAM_CHAT_ID.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
@@ -120,7 +119,7 @@ def send_telegram(text: str):
             timeout=10,
         )
         if not r.ok:
-            log.error("Telegram chyba: %s", r.text)
+            log.error("Telegram chyba %s: %s", r.status_code, r.text)
     except Exception as e:
         log.error("Telegram výjimka: %s", e)
 
@@ -131,7 +130,7 @@ def notify(listing: dict):
         f"🏠 <b>{listing['nadpis']}</b>\n"
         f"💰 {listing['cena']}\n"
         f"📍 {listing.get('lokalita', '—')}\n"
-        f"🔗 <a href=\"{listing['url']}\">Zobrazit inzerát</a>\n"
+        f"🔗 {listing['url']}\n"
         f"📡 {listing['zdroj']}"
     )
     send_telegram(msg)
@@ -147,91 +146,50 @@ def is_blocked(text: str) -> bool:
 
 def process(listing: dict):
     """Zkontroluje duplicitu a odešle notifikaci."""
-    lid = listing["id"]
-    if not is_new(lid):
-        return
-    mark_seen(lid, listing["zdroj"], listing["nadpis"], listing["cena"], listing["url"])
-    notify(listing)
-    log.info("Nový inzerát [%s]: %s — %s", listing["zdroj"], listing["nadpis"], listing["cena"])
+    try:
+        lid = listing["id"]
+        if not is_new(lid):
+            return
+        mark_seen(lid, listing["zdroj"], listing["nadpis"], listing["cena"], listing["url"])
+        notify(listing)
+        log.info("Nový inzerát [%s]: %s — %s", listing["zdroj"], listing["nadpis"], listing["cena"])
+    except Exception as e:
+        log.error("process() chyba: %s", e)
 
 
-# ─────────────────────────────────────────────────────────────
-# SREALITY  (JSON API — čisté requests, bez Playwright)
-#
-# OPRAVA 1: locality_region_id=10 je Středočeský kraj ✓
-#           (původní kód byl správný, Praha by byla =11 — necháme 10)
-#
-# OPRAVA 2: _sreality_url() — category_sub_cb není v seo{},
-#           ale přímo v kořenu objektu estate jako "type" nebo
-#           v poli "seo.category_sub_cb" — správně čteme z
-#           estate["type"]["value"] nebo jako fallback z názvu.
-#           Nejspolehlivější: číst sub_cb přímo z estate dict.
-# ─────────────────────────────────────────────────────────────
-SREALITY_HEADERS = {
+COMMON_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "cs,en;q=0.9",
+}
+
+
+# ─────────────────────────────────────────────────────────────
+# SREALITY  (JSON API)
+#
+# FIX: URL detailu je jednoduše:
+#   https://www.sreality.cz/detail/prodej/byt/<hash_id>
+# Složitý formát s dispozicí a lokalitou v cestě způsoboval 404.
+# ─────────────────────────────────────────────────────────────
+SREALITY_HEADERS = {
+    **COMMON_HEADERS,
+    "Accept": "application/json, text/plain, */*",
     "Referer": "https://www.sreality.cz/",
 }
 
-# locality_region_id=10 = Středočeský kraj (Praha = 11, záměrně vynecháno)
 SREALITY_API = (
     "https://www.sreality.cz/api/cs/v2/estates"
     "?category_main_cb=1"          # byty
     "&category_type_cb=1"          # prodej
-    "&locality_region_id=10"       # Středočeský kraj BEZ Prahy
+    "&locality_region_id=10"       # Středočeský kraj (Praha=11, záměrně vynecháno)
     "&price_max={price_max}"
     "&category_sub_cb={subs}"
     "&per_page=60"
     "&page={page}"
 )
-
-# FIX: Správný slovník slug → musí odpovídat tomu co Sreality čeká v URL
-# Formát detailu: /detail/prodej/byt/2+1/lokalita/hash_id
-# Sreality používá "2+1" (s plusem), ne "2%2B1"
-DISPOSITION_SLUGS = {2: "1+kk", 3: "1+1", 4: "2+kk", 5: "2+1"}
-
-
-def _sreality_url(estate: dict) -> str:
-    """
-    Sestaví klikatelné URL detailu ze slovníku inzerátu.
-
-    OPRAVA: category_sub_cb není v seo{} — je přímo v estate dict
-    pod klíčem "type" (nested) nebo jako samostatné pole.
-    Bezpečně ho extrahujeme ze všech možných míst.
-
-    Správný formát URL:
-      https://www.sreality.cz/detail/prodej/byt/2+kk/stredocesky-kraj-Praha-vychod-ricany/123456789
-    """
-    hash_id = estate.get("hash_id", "")
-    locality = estate.get("seo", {}).get("locality", "")
-
-    # FIX: sub_cb čteme z kořene estate dict, ne z seo{}
-    # API vrací např. estate["type"]["value"] = 4  nebo  estate["category_sub_cb"] = 4
-    sub_cb = (
-        estate.get("category_sub_cb")                          # přímé pole (někdy přítomno)
-        or estate.get("type", {}).get("value")                 # nested type objekt
-        or _guess_sub_cb_from_name(estate.get("name", ""))     # fallback z názvu
-        or 4                                                    # poslední záchrana = 2+kk
-    )
-
-    disp_slug = DISPOSITION_SLUGS.get(int(sub_cb), "byt")
-
-    return f"https://www.sreality.cz/detail/prodej/byt/{disp_slug}/{locality}/{hash_id}"
-
-
-def _guess_sub_cb_from_name(name: str) -> int | None:
-    """Odhadne dispozici z názvu inzerátu jako záložní řešení."""
-    name_lower = name.lower()
-    if "1+kk" in name_lower: return 2
-    if "1+1"  in name_lower: return 3
-    if "2+kk" in name_lower: return 4
-    if "2+1"  in name_lower: return 5
-    return None
 
 
 def scrape_sreality():
@@ -239,7 +197,7 @@ def scrape_sreality():
     subs = "|".join(str(s) for s in SREALITY_DISPOSITIONS)
     found = 0
 
-    for page in range(1, 6):   # max 5 stránek = 300 inzerátů
+    for page in range(1, 6):
         url = SREALITY_API.format(
             price_max=MAX_PRICE,
             subs=subs,
@@ -259,7 +217,7 @@ def scrape_sreality():
 
         for e in estates:
             nadpis = e.get("name", "").strip()
-            if is_blocked(nadpis):
+            if not nadpis or is_blocked(nadpis):
                 continue
 
             cena_raw = e.get("price", 0)
@@ -267,22 +225,26 @@ def scrape_sreality():
                 continue
 
             cena = f"{cena_raw:,} Kč".replace(",", "\u00a0") if cena_raw else "Cena neuvedena"
-            detail_url = _sreality_url(e)
-            locality = e.get("seo", {}).get("locality", "")
             hash_id = str(e.get("hash_id", ""))
+
+            # FIX: správný formát URL — jen hash_id stačí
+            detail_url = f"https://www.sreality.cz/detail/prodej/byt/{hash_id}"
+
+            locality = e.get("seo", {}).get("locality", "")
+            # Pokus o hezčí lokalitu z GPS/name
+            lokalita = locality.replace("-", " ").title() if locality else ""
 
             listing = {
                 "id": f"sreality_{hash_id}",
                 "zdroj": "Sreality",
                 "nadpis": nadpis,
                 "cena": cena,
-                "lokalita": locality.replace("-", " ").title() if locality else "",
+                "lokalita": lokalita,
                 "url": detail_url,
             }
             process(listing)
             found += 1
 
-        # Zkontroluj, jestli je další stránka
         total = data.get("result_size", 0)
         if page * 60 >= total:
             break
@@ -293,109 +255,269 @@ def scrape_sreality():
 
 
 # ─────────────────────────────────────────────────────────────
-# BEZREALITKY  (Playwright — Cloudflare ochrana)
+# BEZREALITKY  (requests + BeautifulSoup)
 #
-# OPRAVA 3: Přidán OSM region ID pro Středočeský kraj.
-#           R439353 = Středočeský kraj ✓  (Praha = R435514, záměrně vynecháno)
-#
-# OPRAVA 4: Dispozice v URL — Bezrealitky používá jiné hodnoty:
-#           DISP_1_KK=1, DISP_1_1=2, DISP_2_KK=3, DISP_2_1=4
-#           Předáváme jako disposition[]=DISP_X_XX ve správném formátu.
+# Nahrazeno Playwright → requests, protože Cloudflare blokoval
+# headless prohlížeč. API endpoint je veřejně přístupný.
+# regionOsmIds=R439353 = Středočeský kraj (Praha R435514 vynecháno)
 # ─────────────────────────────────────────────────────────────
-BEZ_URL = (
-    "https://www.bezrealitky.cz/nemovitosti-byty-domy"
+BEZ_API = (
+    "https://www.bezrealitky.cz/api/record/markers"
     "?offerType=prodej"
     "&estateType=byt"
-    "&regionOsmIds=R439353"        # Středočeský kraj (bez Prahy R435514)
+    "&regionOsmIds=R439353"
     f"&priceMax={MAX_PRICE}"
-    # FIX: správné hodnoty dispozic pro Bezrealitky
-    "&disposition%5B%5D=DISP_1_KK"
-    "&disposition%5B%5D=DISP_1_1"
-    "&disposition%5B%5D=DISP_2_KK"
-    "&disposition%5B%5D=DISP_2_1"
-    "&currency=czk"
+    "&disposition[]=DISP_1_KK"
+    "&disposition[]=DISP_1_1"
+    "&disposition[]=DISP_2_KK"
+    "&disposition[]=DISP_2_1"
+    "&limit=200"
 )
 
+BEZ_DETAIL_API = "https://www.bezrealitky.cz/nemovitosti-byty-domy/{slug}"
 
-def scrape_bezrealitky(page):
-    """Scrape Bezrealitky přes Playwright page objekt."""
+
+def scrape_bezrealitky():
+    """Scrape Bezrealitky přes jejich JSON API endpoint."""
     log.info("Scrapuji Bezrealitky…")
     found = 0
 
     try:
-        page.goto(BEZ_URL, wait_until="domcontentloaded", timeout=30_000)
-        # Počkej na výpis inzerátů
-        page.wait_for_selector("article", timeout=15_000)
+        headers = {
+            **COMMON_HEADERS,
+            "Accept": "application/json",
+            "Referer": "https://www.bezrealitky.cz/",
+        }
+        r = requests.get(BEZ_API, headers=headers, timeout=20)
+        r.raise_for_status()
+        data = r.json()
     except Exception as e:
-        log.error("Bezrealitky načítání: %s", e)
+        log.error("Bezrealitky API chyba: %s", e)
+        # Fallback — zkus scrape stránky
+        _scrape_bezrealitky_html()
         return
 
-    articles = page.query_selector_all("article")
-    log.info("Bezrealitky — nalezeno %d articleů", len(articles))
+    # API vrací seznam markerů nebo seznam inzerátů
+    items = data if isinstance(data, list) else data.get("records", data.get("items", []))
+    log.info("Bezrealitky API — %d položek", len(items))
 
-    for art in articles:
+    for item in items:
         try:
-            # Nadpis
-            h2 = art.query_selector("h2, h3, [class*='title']")
-            nadpis = h2.inner_text().strip() if h2 else ""
+            # Různé formáty odpovědi
+            lid_raw = item.get("id") or item.get("hashId") or item.get("slug", "")
+            if not lid_raw:
+                continue
+            lid = f"bezrealitky_{lid_raw}"
 
-            if not nadpis or is_blocked(nadpis):
+            slug = item.get("uri") or item.get("slug") or str(lid_raw)
+            url = f"https://www.bezrealitky.cz/nemovitosti-byty-domy/{slug}"
+
+            nadpis = item.get("name") or item.get("title") or slug
+            if is_blocked(nadpis):
                 continue
 
-            # Cena
-            cena_el = art.query_selector("[class*='price'], [class*='cena']")
-            cena = cena_el.inner_text().strip() if cena_el else "Cena neuvedena"
-
-            # URL
-            a_el = art.query_selector("a[href]")
-            href = a_el.get_attribute("href") if a_el else ""
-            if not href:
+            price_raw = item.get("price") or item.get("priceAmount") or 0
+            if price_raw and int(price_raw) > MAX_PRICE:
                 continue
-            if href.startswith("/"):
-                href = "https://www.bezrealitky.cz" + href
-            if "bezrealitky.cz" not in href:
-                continue
+            cena = f"{int(price_raw):,} Kč".replace(",", "\u00a0") if price_raw else "Cena neuvedena"
 
-            # ID z URL
-            m = re.search(r"/(\d{5,})", href)
-            lid = f"bezrealitky_{m.group(1)}" if m else f"bezrealitky_{hash(href)}"
-
-            # Lokalita
-            loc_el = art.query_selector("[class*='location'], [class*='address'], [class*='lokalit']")
-            lokalita = loc_el.inner_text().strip() if loc_el else ""
+            lokalita = item.get("address") or item.get("city") or item.get("location") or ""
 
             listing = {
                 "id": lid,
                 "zdroj": "Bezrealitky",
                 "nadpis": nadpis,
                 "cena": cena,
-                "lokalita": lokalita,
-                "url": href,
+                "lokalita": str(lokalita),
+                "url": url,
             }
             process(listing)
             found += 1
 
         except Exception as e:
             log.debug("Bezrealitky item chyba: %s", e)
-            continue
 
     log.info("Bezrealitky hotovo — %d inzerátů.", found)
 
 
+def _scrape_bezrealitky_html():
+    """Fallback: scrape Bezrealitky HTML stránky."""
+    BEZ_URL = (
+        "https://www.bezrealitky.cz/nemovitosti-byty-domy"
+        "?offerType=prodej"
+        "&estateType=byt"
+        "&regionOsmIds=R439353"
+        f"&priceMax={MAX_PRICE}"
+        "&disposition%5B%5D=DISP_1_KK"
+        "&disposition%5B%5D=DISP_1_1"
+        "&disposition%5B%5D=DISP_2_KK"
+        "&disposition%5B%5D=DISP_2_1"
+    )
+    try:
+        r = requests.get(BEZ_URL, headers=COMMON_HEADERS, timeout=20)
+        soup = BeautifulSoup(r.text, "lxml")
+        articles = soup.find_all("article")
+        log.info("Bezrealitky HTML — %d articleů", len(articles))
+
+        for art in articles:
+            try:
+                a_el = art.find("a", href=True)
+                if not a_el:
+                    continue
+                href = a_el["href"]
+                if href.startswith("/"):
+                    href = "https://www.bezrealitky.cz" + href
+
+                m = re.search(r"/(\d{5,})", href)
+                lid = f"bezrealitky_{m.group(1)}" if m else f"bezrealitky_{hash(href)}"
+
+                nadpis = art.find(["h2", "h3"])
+                nadpis = nadpis.get_text(strip=True) if nadpis else href
+                if is_blocked(nadpis):
+                    continue
+
+                cena_el = art.find(class_=re.compile(r"price|cena", re.I))
+                cena = cena_el.get_text(strip=True) if cena_el else "Cena neuvedena"
+
+                loc_el = art.find(class_=re.compile(r"locat|addres|lokalit", re.I))
+                lokalita = loc_el.get_text(strip=True) if loc_el else ""
+
+                process({
+                    "id": lid,
+                    "zdroj": "Bezrealitky",
+                    "nadpis": nadpis,
+                    "cena": cena,
+                    "lokalita": lokalita,
+                    "url": href,
+                })
+            except Exception as e:
+                log.debug("Bezrealitky HTML item: %s", e)
+    except Exception as e:
+        log.error("Bezrealitky HTML fallback chyba: %s", e)
+
+
+# ─────────────────────────────────────────────────────────────
+# BAZOŠ  (requests + BeautifulSoup)
+#
+# Středočeský kraj = kraj=st (kód pro Středočeský)
+# Kategorie 3110 = byty na prodej
+# Filtry: cena do MAX_PRICE, dispozice v nadpisu
+# ─────────────────────────────────────────────────────────────
+BAZOS_DISPOSITIONS_RE = re.compile(
+    r"\b(1\s*\+\s*kk|1\s*\+\s*1|2\s*\+\s*kk|2\s*\+\s*1)\b", re.IGNORECASE
+)
+
+# Bazoš Středočeský kraj = kraj ID 2
+# URL pro byty k prodeji ve Středočeském kraji
+BAZOS_PAGES = [
+    f"https://reality.bazos.cz/byt/?kraj=2&cena2={MAX_PRICE}&hledej=Hledat",
+    f"https://reality.bazos.cz/byt/?kraj=2&cena2={MAX_PRICE}&hledej=Hledat&order=2",
+]
+
+
+def scrape_bazos():
+    """Scrape Bazoš reality — byty ve Středočeském kraji."""
+    log.info("Scrapuji Bazoš…")
+    found = 0
+
+    for page_url in BAZOS_PAGES:
+        try:
+            r = requests.get(page_url, headers=COMMON_HEADERS, timeout=15)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "lxml")
+        except Exception as e:
+            log.error("Bazoš chyba (%s): %s", page_url, e)
+            continue
+
+        inzeraty = soup.find_all("div", class_=re.compile(r"inzeraty", re.I))
+        if not inzeraty:
+            # zkus alternativní selektory
+            inzeraty = soup.find_all("div", class_=re.compile(r"maincontent|list", re.I))
+
+        log.info("Bazoš — nalezeno %d sekcí na %s", len(inzeraty), page_url)
+
+        # Hledej každý inzerát
+        items = soup.find_all("div", class_=re.compile(r"^inz$|inzerat(?!y)", re.I))
+        if not items:
+            items = soup.select("div.maincontent div.inzeraty")
+        if not items:
+            # Nejagresivnější fallback — všechny divy s odkazem na detail
+            items = [a.parent for a in soup.find_all("a", href=re.compile(r"/inzerat/\d+"))]
+
+        for item in items:
+            try:
+                a_el = item.find("a", href=re.compile(r"/inzerat/\d+")) if hasattr(item, "find") else item
+                if not a_el:
+                    continue
+
+                href = a_el.get("href", "")
+                if not href:
+                    continue
+                if not href.startswith("http"):
+                    href = "https://reality.bazos.cz" + href
+
+                m = re.search(r"/inzerat/(\d+)", href)
+                if not m:
+                    continue
+                lid = f"bazos_{m.group(1)}"
+
+                # Nadpis
+                nadpis_el = item.find(["h2", "h3", "strong"]) if hasattr(item, "find") else None
+                nadpis = nadpis_el.get_text(strip=True) if nadpis_el else a_el.get_text(strip=True)
+                if not nadpis or is_blocked(nadpis):
+                    continue
+
+                # Filtr dispozice
+                if not BAZOS_DISPOSITIONS_RE.search(nadpis):
+                    continue
+
+                # Cena
+                cena_el = item.find(class_=re.compile(r"cena|price", re.I)) if hasattr(item, "find") else None
+                cena = cena_el.get_text(strip=True) if cena_el else "Cena neuvedena"
+
+                # Vyfiltruj ceny nad limit (pokud je v textu číslo)
+                price_nums = re.findall(r"[\d\s]+", cena.replace("\xa0", ""))
+                for pn in price_nums:
+                    pn_clean = pn.replace(" ", "").strip()
+                    if pn_clean.isdigit() and int(pn_clean) > MAX_PRICE:
+                        nadpis = ""  # označíme jako přeskočitelný
+                        break
+                if not nadpis:
+                    continue
+
+                # Lokalita
+                loc_el = item.find(class_=re.compile(r"locat|region|kraj|adresa", re.I)) if hasattr(item, "find") else None
+                lokalita = loc_el.get_text(strip=True) if loc_el else "Středočeský kraj"
+
+                listing = {
+                    "id": lid,
+                    "zdroj": "Bazoš",
+                    "nadpis": nadpis,
+                    "cena": cena,
+                    "lokalita": lokalita,
+                    "url": href,
+                }
+                process(listing)
+                found += 1
+
+            except Exception as e:
+                log.debug("Bazoš item chyba: %s", e)
+                continue
+
+        time.sleep(1)
+
+    log.info("Bazoš hotovo — %d inzerátů.", found)
+
+
 # ─────────────────────────────────────────────────────────────
 # REAS  (Playwright — React SPA)
-#
-# OPRAVA 5: Dispozice v URL byly špatně enkódované.
-#           Reas používá hodnoty: 1kk, 1_1, 2kk, 2_1
-#           (bez plus znaků — plus v URL způsoboval ignorování filtru)
 # ─────────────────────────────────────────────────────────────
 REAS_URL = (
     "https://www.reas.cz/vyhledavani"
     "?typ=prodej"
     "&kategorie=byt"
-    "&kraj=stredocesky"            # Středočeský kraj (Praha záměrně vynecháno)
+    "&kraj=stredocesky"
     f"&cenaMax={MAX_PRICE}"
-    # FIX: správné hodnoty dispozic pro Reas (bez %2B enkódování)
     "&dispozice[]=1kk"
     "&dispozice[]=1_1"
     "&dispozice[]=2kk"
@@ -418,7 +540,6 @@ def scrape_reas(page):
         log.error("Reas načítání: %s", e)
         return
 
-    # Zkus více možných selektorů karet
     cards = (
         page.query_selector_all("[class*='PropertyCard']")
         or page.query_selector_all("[class*='property-card']")
@@ -428,17 +549,14 @@ def scrape_reas(page):
 
     for card in cards:
         try:
-            # Nadpis
             h_el = card.query_selector("h2, h3, [class*='title'], [class*='nadpis']")
             nadpis = h_el.inner_text().strip() if h_el else ""
             if not nadpis or is_blocked(nadpis):
                 continue
 
-            # Cena
             price_el = card.query_selector("[class*='price'], [class*='cena'], [class*='Price']")
             cena = price_el.inner_text().strip() if price_el else "Cena neuvedena"
 
-            # URL
             a_el = card.query_selector("a[href]")
             href = a_el.get_attribute("href") if a_el else ""
             if not href:
@@ -483,7 +601,7 @@ def morning_summary():
     lines.append(f"Celkem dnes nalezeno: <b>{len(rows)}</b> inzerátů\n")
 
     for zdroj, nadpis, cena, url in rows[:15]:
-        lines.append(f"• [{zdroj}] {nadpis} — {cena}\n  <a href=\"{url}\">odkaz</a>")
+        lines.append(f"• [{zdroj}] {nadpis} — {cena}\n  {url}")
 
     if len(rows) > 15:
         lines.append(f"\n…a dalších {len(rows) - 15} inzerátů.")
@@ -497,21 +615,27 @@ def morning_summary():
 def run_all():
     log.info("=== Spouštím kontrolu ===")
 
-    # Sreality jede přes requests — bez Playwright
     try:
         scrape_sreality()
     except Exception as e:
         log.error("Sreality selhal: %s", e)
 
-    # Bezrealitky + Reas jedou v jednom Playwright kontextu
+    try:
+        scrape_bezrealitky()
+    except Exception as e:
+        log.error("Bezrealitky selhal: %s", e)
+
+    try:
+        scrape_bazos()
+    except Exception as e:
+        log.error("Bazoš selhal: %s", e)
+
+    # Reas běží v Playwright
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(
                 headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                ],
+                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
             )
             context = browser.new_context(
                 user_agent=(
@@ -522,25 +646,13 @@ def run_all():
                 locale="cs-CZ",
                 viewport={"width": 1280, "height": 800},
             )
-
-            # Bezrealitky
-            try:
-                page = context.new_page()
-                scrape_bezrealitky(page)
-                page.close()
-            except Exception as e:
-                log.error("Bezrealitky selhal: %s", e)
-
-            # Reas
             try:
                 page = context.new_page()
                 scrape_reas(page)
                 page.close()
             except Exception as e:
                 log.error("Reas selhal: %s", e)
-
             browser.close()
-
     except Exception as e:
         log.error("Playwright selhal: %s", e)
 
@@ -549,12 +661,10 @@ def run_all():
 
 def main():
     init_db()
-    log.info("Hlídač bytů spuštěn.")
+    log.info("Hlídač bytů spuštěn. Max cena: %s Kč", f"{MAX_PRICE:,}")
 
-    # Spusť hned při startu
     run_all()
 
-    # Naplánuj opakování
     schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(run_all)
     schedule.every().day.at(f"{MORNING_SUMMARY_HOUR:02d}:00").do(morning_summary)
 
