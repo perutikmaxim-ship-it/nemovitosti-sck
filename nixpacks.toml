@@ -1,0 +1,40 @@
+[phases.setup]
+nixPkgs = [
+    "chromium",
+    "nss",
+    "nspr",
+    "atk",
+    "at-spi2-atk",
+    "xorg.libX11",
+    "xorg.libxcb",
+    "xorg.libXcomposite",
+    "xorg.libXcursor",
+    "xorg.libXdamage",
+    "xorg.libXext",
+    "xorg.libXfixes",
+    "xorg.libXi",
+    "xorg.libXrandr",
+    "xorg.libXrender",
+    "xorg.libXtst",
+    "xorg.libXScrnSaver",
+    "libxkbcommon",
+    "mesa",
+    "expat",
+    "libdrm",
+    "alsa-lib",
+    "cups",
+    "pango",
+    "cairo",
+    "glib",
+    "gtk3",
+    "gdk-pixbuf",
+]
+
+[phases.install]
+cmds = [
+    "pip install -r requirements.txt",
+    "playwright install chromium",
+]
+
+[start]
+cmd = "python scraper.py"
