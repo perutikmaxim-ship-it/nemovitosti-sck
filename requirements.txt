@@ -1,0 +1,29 @@
+# HTTP klienti
+requests==2.31.0
+httpx==0.27.0
+
+# HTML parser
+beautifulsoup4==4.12.3
+lxml==5.2.1
+
+# Telegram bot
+python-telegram-bot==21.3
+
+# Scheduler
+APScheduler==3.10.4
+
+# Konfigurace
+python-dotenv==1.0.1
+PyYAML==6.0.1
+
+# Databáze (vestavěné v Pythonu, ale pro type hints)
+# sqlite3 je součástí stdlib
+
+# Logging (stdlib, ale přidáme colorlog pro přehlednost)
+colorlog==6.8.2
+
+# Retry logika
+tenacity==8.3.0
+
+# Parsování dat
+python-dateutil==2.9.0
