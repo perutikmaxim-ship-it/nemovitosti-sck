@@ -1,0 +1,11 @@
+# Databáze a logy (lokální, nesmí na GitLab)
+nemovitosti.db
+scraper.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
