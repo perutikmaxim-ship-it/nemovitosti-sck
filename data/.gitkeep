@@ -1,0 +1,3 @@
+# Tento adresář obsahuje SQLite databázi s nalezenými inzeráty.
+# Je ignorován Gitem (.gitignore), takže se nenahraje na GitLab.
+# Vytvoří se automaticky při prvním spuštění bota.
